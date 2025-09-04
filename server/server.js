@@ -6,23 +6,22 @@ const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
 
-// Initialize Stripe with error checking
+// Initialize Stripe with graceful error handling
 let stripe;
 try {
   if (!process.env.STRIPE_SECRET_KEY) {
     console.error('ERROR: STRIPE_SECRET_KEY not found in environment variables');
-    console.log('Please add STRIPE_SECRET_KEY to your .env file');
-    process.exit(1);
+    throw new Error('STRIPE_SECRET_KEY is required');
   }
   if (process.env.NODE_ENV !== 'production' && !process.env.STRIPE_SECRET_KEY.startsWith('sk_test_')) {
-    console.error('ERROR: STRIPE_SECRET_KEY is not a test key. Please use a test key in test mode.');
-    process.exit(1);
+    console.error('ERROR: STRIPE_SECRET_KEY is not a test key in non-production environment');
+    throw new Error('Invalid Stripe test key');
   }
   stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
   console.log('✅ Stripe initialized successfully');
 } catch (error) {
   console.error('ERROR: Failed to initialize Stripe:', error.message);
-  process.exit(1);
+  // Don't exit; allow the app to start with limited functionality
 }
 
 const app = express();
@@ -33,11 +32,11 @@ const isVercelServerless = process.env.VERCEL || process.env.NODE_ENV === 'produ
 // Create uploads directory (only for local development)
 const uploadsDir = isVercelServerless ? '/tmp' : 'uploads';
 if (!isVercelServerless && !fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(UploadsDir);
+  fs.mkdirSync(uploadsDir);
   console.log('✅ Created uploads directory');
 }
 
-// Middleware to normalize URLs (prevent double-slash redirects)
+// Middleware to normalize URLs
 app.use((req, res, next) => {
   req.url = req.url.replace(/\/+/g, '/');
   next();
@@ -64,10 +63,9 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// Explicitly handle OPTIONS requests for preflight
 app.options('*', cors());
 
-// Increase payload size limits for file uploads
+// Increase payload size limits
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
@@ -90,7 +88,7 @@ const connectDB = async () => {
     if (!isVercelServerless) {
       console.log('Make sure MongoDB is running on your system');
     }
-    process.exit(1);
+    // Don't exit; allow the app to start with limited functionality
   }
 };
 
@@ -209,7 +207,9 @@ app.get('/', (req, res) => {
       createPaymentIntent: '/api/create-payment-intent',
       submitEntry: '/api/entries',
       getUserEntries: '/api/entries/:userId'
-    }
+    },
+    stripeInitialized: !!stripe,
+    mongoConnected: mongoose.connection.readyState === 1
   });
 });
 
@@ -220,14 +220,17 @@ app.get('/api/health', (req, res) => {
     environment: isVercelServerless ? 'serverless' : 'local',
     timestamp: new Date().toISOString(),
     mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-    stripe: !!stripe ? 'initialized' : 'not initialized'
+    stripe: stripe ? 'initialized' : 'not initialized'
   });
 });
 
 app.get('/api/create-test-entry/:userId', async (req, res) => {
   try {
+    if (!stripe) {
+      return res.status(503).json({ error: 'Stripe service unavailable' });
+    }
     const userId = req.params.userId;
-    const textContent = `This is a comprehensive business strategy...`.repeat(2); // Truncated for brevity
+    const textContent = `This is a comprehensive business strategy...`.repeat(2);
     const entry = new Entry({
       userId,
       category: 'business',
@@ -257,8 +260,11 @@ app.get('/api/create-test-entry/:userId', async (req, res) => {
 
 app.get('/api/create-test-entries/:userId', async (req, res) => {
   try {
+    if (!stripe) {
+      return res.status(503).json({ error: 'Stripe service unavailable' });
+    }
     const userId = req.params.userId;
-    const baseTextContent = `This business strategy focuses on digital transformation...`.repeat(3); // Truncated for brevity
+    const baseTextContent = `This business strategy focuses on digital transformation...`.repeat(3);
     const testEntries = [
       {
         userId,
@@ -318,6 +324,9 @@ app.get('/api/create-test-entries/:userId', async (req, res) => {
 
 app.post('/api/create-payment-intent', async (req, res) => {
   try {
+    if (!stripe) {
+      return res.status(503).json({ error: 'Stripe service unavailable' });
+    }
     console.log('Payment intent request received:', req.body, 'Origin:', req.headers.origin);
     const { category, entryType } = req.body;
     
@@ -375,6 +384,9 @@ app.post('/api/create-payment-intent', async (req, res) => {
 
 app.post('/api/entries', upload.single('file'), async (req, res) => {
   try {
+    if (!stripe) {
+      return res.status(503).json({ error: 'Stripe service unavailable' });
+    }
     console.log('Entry submission received:', {
       body: req.body,
       file: req.file ? { 
@@ -573,10 +585,14 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), (req, res) =
   let event;
 
   try {
+    if (!process.env.STRIPE_WEBHOOK_SECRET) {
+      console.error('ERROR: STRIPE_WEBHOOK_SECRET not found in environment variables');
+      return res.status(400).json({ error: 'Webhook secret not configured' });
+    }
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.log(`Webhook signature verification failed.`, err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    console.error(`Webhook signature verification failed:`, err.message);
+    return res.status(400).json({ error: `Webhook Error: ${err.message}` });
   }
 
   if (event.type === 'payment_intent.payment_failed') {
