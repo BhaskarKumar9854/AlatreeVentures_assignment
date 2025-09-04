@@ -27,35 +27,62 @@ try {
 
 const app = express();
 
-// Create uploads directory if it doesn't exist
-const uploadsDir = 'uploads';
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir);
-  console.log('✅ Created uploads directory');
+// For Vercel deployment - don't create uploads directory in serverless environment
+const isVercel = process.env.VERCEL || process.env.NODE_ENV === 'production';
+
+if (!isVercel) {
+  // Create uploads directory if it doesn't exist (local development only)
+  const uploadsDir = 'uploads';
+  if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir);
+    console.log('✅ Created uploads directory');
+  }
 }
 
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static('uploads'));
 
-// MongoDB Connection with error handling
+// Only serve static files in local development
+if (!isVercel) {
+  app.use('/uploads', express.static('uploads'));
+}
+
+// MongoDB connection with connection pooling for Vercel
+let cachedDb = null;
+
 const connectDB = async () => {
+  if (cachedDb && mongoose.connections[0].readyState === 1) {
+    console.log('Using cached MongoDB connection');
+    return cachedDb;
+  }
+  
   try {
     const mongoURI = process.env.MONGODB_URI || 'mongodb://localhost:27017/top216';
+    
+    // Close existing connections
+    if (mongoose.connections[0].readyState !== 0) {
+      await mongoose.disconnect();
+    }
+    
     await mongoose.connect(mongoURI, {
       useNewUrlParser: true,
       useUnifiedTopology: true,
+      bufferCommands: false,
+      bufferMaxEntries: 0,
+      maxPoolSize: 10,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
     });
+    
+    cachedDb = mongoose.connections[0];
     console.log('✅ MongoDB connected successfully');
+    return cachedDb;
   } catch (error) {
     console.error('ERROR: MongoDB connection failed:', error.message);
-    console.log('Make sure MongoDB is running on your system');
-    process.exit(1);
+    throw error;
   }
 };
-
-connectDB();
 
 // Entry Schema
 const entrySchema = new mongoose.Schema({
@@ -111,12 +138,15 @@ const entrySchema = new mongoose.Schema({
   status: { type: String, enum: ['submitted', 'under-review', 'finalist', 'winner', 'rejected'], default: 'submitted' }
 }, { timestamps: true });
 
-const Entry = mongoose.model('Entry', entrySchema);
+// Prevent model re-compilation in serverless environment
+const Entry = mongoose.models.Entry || mongoose.model('Entry', entrySchema);
 
-// File upload configuration
+// File upload configuration - Modified for Vercel
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    cb(null, 'uploads/');
+    // Use /tmp directory in Vercel
+    const uploadDir = isVercel ? '/tmp' : 'uploads/';
+    cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
@@ -150,12 +180,27 @@ const calculateFees = (baseAmount) => {
   return { stripeFee, totalAmount };
 };
 
+// Middleware to ensure database connection
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (error) {
+    console.error('Database connection error:', error);
+    res.status(500).json({ 
+      error: 'Database connection failed',
+      message: error.message 
+    });
+  }
+});
+
 // Routes
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     message: 'Server is running',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    environment: isVercel ? 'vercel' : 'local'
   });
 });
 
@@ -168,7 +213,7 @@ app.get('/api/create-test-entry/:userId', async (req, res) => {
       entryType: 'text',
       title: 'Sample Business Strategy Entry',
       description: 'A comprehensive business strategy for digital transformation in modern enterprises',
-      textContent: 'This is a detailed business strategy...'.repeat(3),
+      textContent: 'This is a detailed business strategy that focuses on leveraging digital technologies to transform traditional business models. The strategy encompasses customer experience enhancement, operational efficiency improvements, and data-driven decision making. By implementing these digital transformation initiatives, organizations can achieve sustainable competitive advantages in the modern marketplace. The approach involves careful planning, stakeholder alignment, and phased implementation to ensure successful adoption across all business units. Digital transformation requires a holistic view of technology integration, process optimization, and cultural change management. Organizations must evaluate their current state, define their digital vision, and create a roadmap for transformation that aligns with business objectives and market opportunities.'.repeat(2),
       entryFee: 49,
       stripeFee: 2,
       totalAmount: 51,
@@ -198,7 +243,7 @@ app.get('/api/create-test-entries/:userId', async (req, res) => {
         entryType: 'text',
         title: 'Innovative Business Strategy',
         description: 'A comprehensive business strategy for modern markets',
-        textContent: 'This business strategy focuses on digital transformation...'.repeat(4),
+        textContent: 'This business strategy focuses on digital transformation and innovation in competitive markets. The approach emphasizes customer-centric design, agile methodologies, and data-driven insights to create sustainable value propositions. Key components include market analysis, competitive positioning, resource allocation, and performance metrics that align with organizational goals and stakeholder expectations. The strategy incorporates emerging technologies, sustainable practices, and adaptive frameworks to navigate dynamic business environments. Implementation requires cross-functional collaboration, continuous monitoring, and iterative improvements based on market feedback and performance indicators.'.repeat(3),
         entryFee: 49,
         stripeFee: 2,
         totalAmount: 51,
@@ -345,8 +390,10 @@ app.post('/api/entries', upload.single('file'), async (req, res) => {
     };
     if (entryType === 'text') {
       entryData.textContent = textContent;
-    } else  if (entryType === 'pitch-deck' && req.file) {
-      entryData.fileUrl = `/uploads/${req.file.filename}`;
+    } else if (entryType === 'pitch-deck' && req.file) {
+      // In Vercel, you'll need to upload to cloud storage (S3, Cloudinary, etc.)
+      // For now, store relative path - you'll need to modify this for production
+      entryData.fileUrl = isVercel ? `/tmp/${req.file.filename}` : `/uploads/${req.file.filename}`;
     } else if (entryType === 'video') {
       entryData.videoUrl = videoUrl;
     }
@@ -411,15 +458,21 @@ app.delete('/api/entries/:id', async (req, res) => {
       return res.status(403).json({ error: 'Not authorized to delete this entry' });
     }
     
+    // Handle file deletion (modified for Vercel)
     if (entry.entryType === 'pitch-deck' && entry.fileUrl) {
-      const filePath = path.join(__dirname, entry.fileUrl);
-      try {
-        if (fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
-          console.log('Deleted file:', filePath);
+      const filePath = isVercel 
+        ? entry.fileUrl  // In Vercel, files are in /tmp and auto-cleaned
+        : path.join(__dirname, entry.fileUrl);
+      
+      if (!isVercel) {
+        try {
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            console.log('Deleted file:', filePath);
+          }
+        } catch (fileError) {
+          console.error('Error deleting file:', fileError.message);
         }
-      } catch (fileError) {
-        console.error('Error deleting file:', fileError.message);
       }
     }
     
@@ -437,7 +490,8 @@ app.delete('/api/entries/:id', async (req, res) => {
   }
 });
 
-app.post('/api/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+// Webhook route - Modified for Vercel
+app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
   try {
@@ -448,14 +502,15 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), (req, res) =
   }
   if (event.type === 'payment_intent.payment_failed') {
     const paymentIntent = event.data.object;
-    Entry.findOneAndUpdate(
+    await Entry.findOneAndUpdate(
       { paymentIntentId: paymentIntent.id },
       { paymentStatus: 'failed' }
-    ).exec();
+    );
   }
   res.json({ received: true });
 });
 
+// Error handling middleware
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
   res.status(500).json({
@@ -465,9 +520,15 @@ app.use((error, req, res, next) => {
   });
 });
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
-  console.log(`🧪 Create test entry: http://localhost:${PORT}/api/create-test-entry/user_test123`);
-});
+// For local development
+if (!isVercel) {
+  const PORT = process.env.PORT || 5000;
+  app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+    console.log(`🧪 Create test entry: http://localhost:${PORT}/api/create-test-entry/user_test123`);
+  });
+}
+
+// Export for Vercel
+module.exports = app;
